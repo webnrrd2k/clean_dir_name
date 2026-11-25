@@ -1,0 +1,428 @@
+//! `clean_dir_name` — a Rust port of a Python script that reads lines of
+//! text from stdin and turns each one into a "safe" string suitable for use
+//! as a directory name, filename, or filtered token on Windows/macOS/Linux.
+//!
+//! Behavior is ported 1:1 from the original Python `clean_for_directory()`
+//! function and CLI, including a couple of quirks in the original code that
+//! are preserved intentionally for fidelity (see comments below).
+
+use regex::Regex;
+use std::env;
+use std::fs::File;
+use std::io::{self, BufRead};
+use std::path::PathBuf;
+use unicode_normalization::UnicodeNormalization;
+
+/// Normalize an arbitrary string of text into a lowercase, ASCII,
+/// filesystem-safe token.
+///
+/// Steps (mirrors the Python implementation exactly):
+/// 1. Manually translate a couple of characters that Unicode's compatibility
+///    decomposition (NFKD) does *not* decompose into an ASCII-representable
+///    form on their own — notably the Polish `Ł`/`ł` (stroked L), which NFKD
+///    leaves untouched rather than mapping to a plain `L`/`l`.
+/// 2. Run NFKD normalization, then drop every remaining non-ASCII
+///    character (this is what "compose to ASCII, ignoring failures" does in
+///    Python's `.encode('ascii', 'ignore').decode('ascii')`). This turns
+///    accented Latin letters like `é` into their base ASCII letter `e`
+///    (the accent is decomposed into a separate combining-mark codepoint,
+///    which is then dropped since it isn't ASCII), while characters with no
+///    ASCII-ish decomposition (e.g. CJK ideographs) disappear entirely.
+/// 3. Lowercase everything.
+/// 4. Collapse one or more consecutive `&` characters into a single `+`
+///    (so `&` and `&&&` both become `+`). This has to happen *before* the
+///    disallowed-character strip below, since `&` isn't in the allowed set
+///    and would otherwise be deleted before it ever got a chance to become
+///    `+`.
+/// 5. Strip every remaining character that isn't a lowercase ASCII letter,
+///    digit, whitespace, `+`, `_`, or `-`.
+/// 6. Collapse runs of whitespace into a single underscore.
+/// 7. Trim leading/trailing underscores.
+/// 8. Collapse the literal sequence `_+_` into `+`.
+pub fn clean_for_directory(input: &str) -> String {
+    // --- Step 1: manual translation for characters NFKD won't touch ---
+    let mut text = input.replace('Ł', "L").replace('ł', "l");
+
+    // --- Step 2: NFKD-decompose, then keep only ASCII codepoints ---
+    // (combining marks produced by decomposition are non-ASCII and get
+    // dropped here, which is what strips accents from e.g. "café" -> "cafe")
+    text = text.nfkd().filter(char::is_ascii).collect::<String>();
+
+    // --- Step 3: lowercase ---
+    text = text.to_lowercase();
+
+    // --- Step 4: collapse one-or-more '&' into a single '+' ---
+    let ampersands = Regex::new(r"&+").expect("valid regex");
+    text = ampersands.replace_all(&text, "+").into_owned();
+
+    // --- Step 5: remove anything that isn't [a-z0-9\s+_-] ---
+    let disallowed = Regex::new(r"[^a-z0-9\s+_-]").expect("valid regex");
+    text = disallowed.replace_all(&text, "").into_owned();
+
+    // --- Step 6: collapse whitespace runs into a single underscore ---
+    let whitespace = Regex::new(r"\s+").expect("valid regex");
+    text = whitespace.replace_all(&text, "_").into_owned();
+
+    // --- Step 7: trim leading/trailing underscores ---
+    text = text.trim_matches('_').to_string();
+
+    // --- Step 8: collapse "_+_" -> "+" ---
+    text = text.replace("_+_", "+");
+
+    // --- Step 8: collapse two underscores to one "__" -> "_" ---
+    text = text.replace("__", "_");
+
+    text
+}
+
+/// Parsed command-line options, mirroring the original `argparse` setup.
+///
+/// Note: `--in` and `--incr` are accepted (and stored) exactly as in the
+/// original Python script, but the original script never actually reads
+/// `args.in` or `args.incr` anywhere — input always comes from stdin. That
+/// dead behavior is preserved here rather than "fixed", to keep this a
+/// faithful port. Unknown/malformed flags fall back gracefully rather than
+/// hard-erroring, again matching the permissive spirit of the source.
+#[derive(Debug, Default)]
+struct Args {
+    /// Value of `--in <VALUE>` / `--in=<VALUE>` (unused, kept for parity).
+    #[allow(dead_code)]
+    input: Option<String>,
+    /// Value of `--incr <VALUE>` / `--incr=<VALUE>` (unused, kept for parity).
+    #[allow(dead_code)]
+    incr: Option<String>,
+    /// `--filter`: print the cleaned line instead of creating anything.
+    filter: bool,
+    /// `-f`: same as `--filter`.
+    f: bool,
+    /// `-txt`: touch an empty `<name>.txt` file instead of making a directory.
+    txt: bool,
+    /// `-md`: touch an empty `<name>.md` file instead of making a directory.
+    md: bool,
+}
+
+/// Minimal hand-rolled argument parser.
+///
+/// `argparse` in the original script allows both `--flag value` and
+/// `--flag=value` forms for the value-taking options, and treats `-txt`
+/// and `-md` as ordinary (if unconventionally-named) flags. We replicate
+/// both of those behaviors here.
+fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Args {
+    let mut result = Args::default();
+    let mut iter = args.into_iter().peekable();
+
+    while let Some(arg) = iter.next() {
+        if let Some(value) = arg.strip_prefix("--in=") {
+            result.input = Some(value.to_string());
+        } else if arg == "--in" {
+            result.input = iter.next();
+        } else if let Some(value) = arg.strip_prefix("--incr=") {
+            result.incr = Some(value.to_string());
+        } else if arg == "--incr" {
+            result.incr = iter.next();
+        } else if arg == "--filter" {
+            result.filter = true;
+        } else if arg == "-f" {
+            result.f = true;
+        } else if arg == "-txt" {
+            result.txt = true;
+        } else if arg == "-md" {
+            result.md = true;
+        }
+        // Anything else (e.g. -h/--help) is silently ignored; this is a
+        // straightforward port, not a full argparse re-implementation.
+    }
+
+    result
+}
+
+fn main() -> io::Result<()> {
+    let args = parse_args(env::args().skip(1));
+
+    let stdin = io::stdin();
+    if atty_stdin_is_terminal() {
+        eprintln!("Enter text (Press Ctrl+D or Ctrl+Z to finish):");
+    }
+
+    let cwd = env::current_dir()?;
+
+    for line in stdin.lock().lines() {
+        let raw_line = line?;
+        // Strip trailing newline variants, then any leading/trailing
+        // whitespace and tabs (mirrors the chained .rstrip/.strip calls).
+        let trimmed = raw_line
+            .trim_end_matches(['\n', '\r'])
+            .trim()
+            .trim_matches('\t');
+
+        let clean_line = clean_for_directory(trimmed);
+
+        if clean_line.is_empty() {
+            continue;
+        }
+
+        if args.filter || args.f {
+            println!("{clean_line}");
+        } else if args.txt {
+            let file_path: PathBuf = cwd.join(format!("{clean_line}.txt"));
+            touch(&file_path)?;
+        } else if args.md {
+            let file_path: PathBuf = cwd.join(format!("{clean_line}.md"));
+            touch(&file_path)?;
+        } else {
+            let dir_path: PathBuf = cwd.join(&clean_line);
+            std::fs::create_dir_all(dir_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Create an empty file if it doesn't already exist (equivalent to
+/// `pathlib.Path.touch()`'s default `exist_ok=True` usage in the source).
+fn touch(path: &PathBuf) -> io::Result<()> {
+    if !path.exists() {
+        File::create(path)?;
+    }
+    Ok(())
+}
+
+/// Returns true if stdin is connected to an interactive terminal.
+/// Uses the platform `isatty()` call directly to avoid pulling in an
+/// extra crate for a single check.
+fn atty_stdin_is_terminal() -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let stdin = io::stdin();
+        unsafe { libc_isatty(stdin.as_raw_fd()) != 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "isatty"]
+    fn libc_isatty(fd: i32) -> i32;
+}
+
+// ---------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Basic behavior --------------------------------------------------
+
+    #[test]
+    fn empty_string_stays_empty() {
+        assert_eq!(clean_for_directory(""), "");
+    }
+
+    #[test]
+    fn plain_ascii_lowercase_passthrough() {
+        assert_eq!(clean_for_directory("hello"), "hello");
+    }
+
+    #[test]
+    fn uppercase_is_lowercased() {
+        assert_eq!(clean_for_directory("HELLO World"), "hello_world");
+    }
+
+    #[test]
+    fn digits_are_preserved() {
+        assert_eq!(clean_for_directory("Project 42"), "project_42");
+    }
+
+    // -- Unicode normalization -------------------------------------------
+
+    #[test]
+    fn accented_latin_letters_are_stripped_to_ascii() {
+        assert_eq!(clean_for_directory("café"), "cafe");
+        assert_eq!(clean_for_directory("naïve"), "naive");
+        assert_eq!(clean_for_directory("Zürich"), "zurich");
+    }
+
+    #[test]
+    fn polish_l_with_stroke_is_translated_manually() {
+        // NFKD does NOT decompose Ł/ł into L/l on its own; the function
+        // special-cases them before normalization.
+        assert_eq!(clean_for_directory("Łukasz"), "lukasz");
+        assert_eq!(clean_for_directory("złoty"), "zloty");
+    }
+
+    #[test]
+    fn non_latin_scripts_with_no_ascii_decomposition_vanish() {
+        // CJK ideographs have no ASCII-ish decomposition, so they are
+        // dropped entirely, same as Python's encode('ascii', 'ignore').
+        assert_eq!(clean_for_directory("日本語"), "");
+        // Mixed content keeps the ASCII-representable part.
+        assert_eq!(clean_for_directory("Tokyo 東京"), "tokyo");
+    }
+
+    #[test]
+    fn combining_diacritics_alone_are_removed_not_kept_as_junk() {
+        // e + combining acute accent (decomposed form) should reduce to "e",
+        // not leave behind stray marks.
+        let composed = "e\u{0301}"; // 'é' as e + combining acute
+        assert_eq!(clean_for_directory(composed), "e");
+    }
+
+    // -- Disallowed character stripping -----------------------------------
+
+    #[test]
+    fn punctuation_and_symbols_are_removed() {
+        assert_eq!(clean_for_directory("Hello, World!"), "hello_world");
+        assert_eq!(clean_for_directory("a/b\\c:d*e?f"), "abcdef");
+        assert_eq!(clean_for_directory("100% done (final)"), "100_done_final");
+    }
+
+    #[test]
+    fn ampersand_is_converted_to_plus() {
+        assert_eq!(clean_for_directory("Rock & Roll"), "rock+roll");
+        assert_eq!(clean_for_directory("A && B"), "a+b");
+        assert_eq!(clean_for_directory("&&&"), "+");
+    }
+
+    #[test]
+    fn ampersand_adjacent_to_underscore_still_collapses_cleanly() {
+        // "a_&_b" -> ampersand becomes '+' -> "a_+_b" -> "_+_" collapses to "+"
+        assert_eq!(clean_for_directory("a_&_b"), "a+b");
+    }
+
+    #[test]
+    fn plus_underscore_plus_pattern_collapses() {
+        assert_eq!(clean_for_directory("a_+_b"), "a+b");
+    }
+
+    #[test]
+    fn hyphen_underscore_plus_are_preserved() {
+        assert_eq!(
+            clean_for_directory("already-safe_name+here"),
+            "already-safe_name+here"
+        );
+    }
+
+    // -- Whitespace handling ------------------------------------------------
+
+    #[test]
+    fn multiple_spaces_collapse_to_one_underscore() {
+        assert_eq!(clean_for_directory("a    b"), "a_b");
+    }
+
+    #[test]
+    fn tabs_and_newlines_inside_the_string_become_underscores() {
+        assert_eq!(clean_for_directory("a\tb\nc"), "a_b_c");
+    }
+
+    #[test]
+    fn leading_and_trailing_whitespace_becomes_leading_trailing_underscore_then_is_trimmed() {
+        assert_eq!(clean_for_directory("  padded  "), "padded");
+    }
+
+    #[test]
+    fn only_whitespace_or_disallowed_chars_yields_empty_string() {
+        assert_eq!(clean_for_directory("   "), "");
+        assert_eq!(clean_for_directory("!!!???"), "");
+    }
+
+    // -- Leading/trailing underscore trimming -----------------------------
+
+    #[test]
+    fn leading_and_trailing_underscores_are_trimmed() {
+        assert_eq!(clean_for_directory("___name___"), "name");
+    }
+
+    #[test]
+    fn internal_underscores_are_preserved() {
+        assert_eq!(clean_for_directory("my_file_name"), "my_file_name");
+    }
+
+    // -- Combined / realistic cases ----------------------------------------
+
+    #[test]
+    fn realistic_title_case_sentence() {
+        assert_eq!(
+            clean_for_directory("Q3 Planning: Résumé & Ünïcode Review!"),
+            "q3_planning_resume+unicode_review"
+        );
+    }
+
+    #[test]
+    fn already_clean_input_is_idempotent() {
+        let once = clean_for_directory("meeting_notes_2024-06-01");
+        let twice = clean_for_directory(&once);
+        assert_eq!(once, twice);
+        assert_eq!(once, "meeting_notes_2024-06-01");
+    }
+
+    #[test]
+    fn calling_twice_on_any_input_is_stable() {
+        // Cleaning an already-cleaned string should never change it further
+        // (idempotency is a nice safety property for a normalizer like this).
+        let input = "  Some / Wëird\\ Input!! &&  ";
+        let once = clean_for_directory(input);
+        let twice = clean_for_directory(&once);
+        assert_eq!(once, twice);
+    }
+
+    // -- Argument parsing ----------------------------------------------------
+
+    #[test]
+    fn parses_filter_flag() {
+        let args = parse_args(vec!["--filter".to_string()]);
+        assert!(args.filter);
+        assert!(!args.f);
+    }
+
+    #[test]
+    fn parses_short_f_flag() {
+        let args = parse_args(vec!["-f".to_string()]);
+        assert!(args.f);
+    }
+
+    #[test]
+    fn parses_txt_and_md_flags() {
+        let args = parse_args(vec!["-txt".to_string()]);
+        assert!(args.txt);
+        assert!(!args.md);
+
+        let args = parse_args(vec!["-md".to_string()]);
+        assert!(args.md);
+        assert!(!args.txt);
+    }
+
+    #[test]
+    fn parses_in_and_incr_with_space_form() {
+        let args = parse_args(vec![
+            "--in".to_string(),
+            "hello".to_string(),
+            "--incr".to_string(),
+            "world".to_string(),
+        ]);
+        assert_eq!(args.input.as_deref(), Some("hello"));
+        assert_eq!(args.incr.as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn parses_in_and_incr_with_equals_form() {
+        let args = parse_args(vec!["--in=hello".to_string(), "--incr=world".to_string()]);
+        assert_eq!(args.input.as_deref(), Some("hello"));
+        assert_eq!(args.incr.as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn no_args_yields_all_defaults_false() {
+        let args = parse_args(Vec::<String>::new());
+        assert!(!args.filter);
+        assert!(!args.f);
+        assert!(!args.txt);
+        assert!(!args.md);
+        assert!(args.input.is_none());
+        assert!(args.incr.is_none());
+    }
+}
