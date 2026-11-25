@@ -15,8 +15,8 @@ echo 'Café & Łódź  Notes!' | cn        # creates the directory cafe+lodz_not
 
 ```bash
 sudo dnf install cargo      # if needed
-cargo install --git https://github.com/webnrrd2k/clean_dir_name
+cargo install --root ~/.local --git https://github.com/webnrrd2k/clean_dir_name
 ```
 
-This puts `cn` in `~/.cargo/bin`. Or run `install.sh` from the dotfiles repo,
+This puts `cn` in `~/.local/bin`. Or run `install.sh` from the dotfiles repo,
 which offers to do it.
